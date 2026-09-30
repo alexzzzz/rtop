@@ -40,6 +40,33 @@ type NvmlDeviceGetCountV2 = unsafe extern "C" fn(*mut u32) -> u32;
 type NvmlDeviceGetHandleByIndexV2 = unsafe extern "C" fn(u32, *mut NvmlDevice) -> u32;
 type NvmlDeviceGetPowerManagementDefaultLimit = unsafe extern "C" fn(NvmlDevice, *mut u32) -> u32;
 type NvmlDeviceGetUuid = unsafe extern "C" fn(NvmlDevice, *mut c_char, u32) -> u32;
+type NvmlDeviceGetUtilizationRates = unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> u32;
+type NvmlDeviceGetTemperature =
+    unsafe extern "C" fn(NvmlDevice, NvmlTemperatureSensor, *mut u32) -> u32;
+type NvmlDeviceGetPowerUsage = unsafe extern "C" fn(NvmlDevice, *mut u32) -> u32;
+type NvmlDeviceGetClockInfo = unsafe extern "C" fn(NvmlDevice, NvmlClockType, *mut u32) -> u32;
+type NvmlDeviceGetMaxClockInfo = unsafe extern "C" fn(NvmlDevice, NvmlClockType, *mut u32) -> u32;
+
+/// `NVML_TEMPERATURE_GPU` — the GPU die sensor.
+const NVML_TEMPERATURE_GPU: NvmlTemperatureSensor = 0;
+/// `NVML_CLOCK_GRAPHICS` — the graphics/SM clock domain.
+const NVML_CLOCK_GRAPHICS: NvmlClockType = 0;
+
+/// `nvmlTemperatureSensors_t` selector, as passed to
+/// `nvmlDeviceGetTemperature`.
+type NvmlTemperatureSensor = u32;
+/// `nvmlClockType_t` selector, as passed to the clock queries.
+type NvmlClockType = u32;
+
+/// NVML utilization sample, in percent. Written by
+/// `nvmlDeviceGetUtilizationRates`; `memory` is the VRAM controller
+/// occupancy, which rtop does not currently render.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NvmlUtilization {
+    gpu: u32,
+    memory: u32,
+}
 
 type NvPhysicalGpuHandle = *mut c_void;
 
@@ -195,142 +222,239 @@ const ID_GPU_GET_ALL_CLOCK_FREQUENCIES: u32 = 0xdcb6_16c3;
 const ID_GPU_CLIENT_POWER_TOPO_GET_STATUS: u32 = 0xedcf_624e;
 const ID_GPU_CLIENT_POWER_POLICIES_GET_INFO: u32 = 0x3420_6d86;
 
-/// Per-device metadata fetched from NVML at discovery time. Bound
-/// once per device; immutable for the device's lifetime.
-struct NvmlMeta {
-    /// Default power management limit (TDP) in milliwatts. `0`
-    /// when NVML did not return a value for this device — the
-    /// caller treats `0` as "no TDP info available".
+/// A device as NVML sees it, paired with the static metadata rtop
+/// binds once at discovery. The handle stays valid until
+/// `nvmlShutdown`, so it outlives every per-cycle query.
+#[derive(Clone)]
+struct NvmlDeviceEntry {
+    handle: NvmlDevice,
+    /// Default power management limit (TDP) in milliwatts. `0` when
+    /// NVML did not return a value for this device — the caller
+    /// treats `0` as "no TDP info available".
     tdp_mw: u32,
-    /// `nvmlDeviceGetUUID` output (e.g. `GPU-12345678-...`).
-    /// Empty string when the call failed or NVML was unavailable;
-    /// the caller's stable-id fallback path handles the empty
-    /// case without losing the device.
+    /// `nvmlDeviceGetUUID` output (e.g. `GPU-12345678-...`). Empty
+    /// string when the call failed; the caller's stable-id fallback
+    /// path handles the empty case without losing the device.
     uuid: String,
 }
 
-/// Query per-device metadata (TDP + UUID) for each GPU via NVML.
-/// Returns `None` when NVML is unavailable (e.g. not installed);
-/// returns `Some(vec)` whose length is `min(nvml_count, device_count)`.
-/// Per-device fields fall back to `0` / `""` on per-call failure.
+/// Resolved `nvml.dll` function-pointer table.
 ///
-/// Index correspondence between NVML and NvAPI is documented as
-/// "best-effort": both APIs typically enumerate in the same
-/// driver-defined order (PCI bus). The TDP wiring has relied on
-/// this ordering since rtop's first NVIDIA support; the UUID
-/// wiring inherits the same assumption.
-fn query_nvml_metadata(device_count: usize) -> Option<Vec<NvmlMeta>> {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-    use windows::core::PCSTR;
+/// NVML is the primary metric source on Windows: driver 570+ reports
+/// `NVAPI_NOT_SUPPORTED` for the legacy NvAPI entry points rtop
+/// originally used for utilization, temperature, power, and clocks,
+/// while every function resolved here is still served. Symbols whose
+/// absence is tolerable (currently only the max-clock query) resolve
+/// to `None` instead of failing the whole load.
+struct NvmlFunctions {
+    _library: OwnedLibrary,
+    init: NvmlInitV2,
+    shutdown: NvmlShutdownFn,
+    get_count: NvmlDeviceGetCountV2,
+    get_handle: NvmlDeviceGetHandleByIndexV2,
+    get_default_limit: NvmlDeviceGetPowerManagementDefaultLimit,
+    get_uuid: NvmlDeviceGetUuid,
+    get_utilization_rates: NvmlDeviceGetUtilizationRates,
+    get_temperature: NvmlDeviceGetTemperature,
+    get_power_usage: NvmlDeviceGetPowerUsage,
+    get_clock_info: NvmlDeviceGetClockInfo,
+    /// Optional — absent on NVML builds predating the query.
+    get_max_clock_info: Option<NvmlDeviceGetMaxClockInfo>,
+}
 
-    let dll_name: Vec<u16> = "nvml.dll\0".encode_utf16().collect();
-    // SAFETY: LoadLibraryW receives a valid null-terminated UTF-16 DLL name.
-    let library =
-        OwnedLibrary::new(unsafe { LoadLibraryW(windows::core::PCWSTR(dll_name.as_ptr())) }.ok()?)?;
-    let handle = library.get();
+impl NvmlFunctions {
+    /// Load `nvml.dll` and resolve the function table without
+    /// initialising NVML. Returns `None` when the library or a
+    /// required symbol is missing.
+    fn load() -> Option<Self> {
+        use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows::core::PCSTR;
 
-    macro_rules! load_fn {
-        ($name:literal, $ty:ty) => {{
-            // SAFETY: handle is a valid loaded nvml.dll module.
-            let proc = unsafe { GetProcAddress(handle, PCSTR(concat!($name, "\0").as_ptr())) }?;
-            // SAFETY: GetProcAddress returned a non-null address for a known
-            // NVML symbol; the target type matches the documented signature.
-            unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(proc) }
-        }};
-    }
+        let dll_name: Vec<u16> = "nvml.dll\0".encode_utf16().collect();
+        // SAFETY: LoadLibraryW receives a valid null-terminated UTF-16 DLL name.
+        // The returned handle is checked via ok()? before use.
+        let library = OwnedLibrary::new(
+            unsafe { LoadLibraryW(windows::core::PCWSTR(dll_name.as_ptr())) }.ok()?,
+        )?;
+        let handle = library.get();
 
-    let init: NvmlInitV2 = load_fn!("nvmlInit_v2", NvmlInitV2);
-    let shutdown: NvmlShutdownFn = load_fn!("nvmlShutdown", NvmlShutdownFn);
-    let get_count: NvmlDeviceGetCountV2 = load_fn!("nvmlDeviceGetCount_v2", NvmlDeviceGetCountV2);
-    let get_handle: NvmlDeviceGetHandleByIndexV2 = load_fn!(
-        "nvmlDeviceGetHandleByIndex_v2",
-        NvmlDeviceGetHandleByIndexV2
-    );
-    let get_default_limit: NvmlDeviceGetPowerManagementDefaultLimit = load_fn!(
-        "nvmlDeviceGetPowerManagementDefaultLimit",
-        NvmlDeviceGetPowerManagementDefaultLimit
-    );
-    let get_uuid: NvmlDeviceGetUuid = load_fn!("nvmlDeviceGetUUID", NvmlDeviceGetUuid);
-
-    // SAFETY: init was loaded from nvml.dll.
-    let ret = unsafe { init() };
-    if ret != NVML_SUCCESS {
-        tracing::debug!(
-            subsystem = %crate::log::Subsystem::GpuNvml,
-            code = %crate::log::Hex(ret),
-            "nvmlInit_v2 failed",
-        );
-        return None;
-    }
-
-    let mut nvml_count: u32 = 0;
-    // SAFETY: nvml_count is a valid pointer.
-    let _ = unsafe { get_count(&mut nvml_count) };
-
-    let limit = (nvml_count as usize).min(device_count);
-    let mut metas = Vec::with_capacity(limit);
-    for i in 0..limit as u32 {
-        let mut dev: NvmlDevice = std::ptr::null_mut();
-        // SAFETY: i is within the reported count.
-        if unsafe { get_handle(i, &mut dev) } != NVML_SUCCESS || dev.is_null() {
-            metas.push(NvmlMeta {
-                tdp_mw: 0,
-                uuid: String::new(),
-            });
-            continue;
+        /// Resolve a required NVML symbol; a missing one aborts the load.
+        macro_rules! load_fn {
+            ($name:literal, $ty:ty) => {{
+                // SAFETY: handle is a valid loaded nvml.dll module.
+                let proc = unsafe { GetProcAddress(handle, PCSTR(concat!($name, "\0").as_ptr())) }?;
+                // SAFETY: GetProcAddress returned a non-null address for a known
+                // NVML symbol; the target type matches the documented signature.
+                unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(proc) }
+            }};
         }
 
-        let mut limit_mw: u32 = 0;
-        // SAFETY: dev is a valid handle; limit_mw is a valid pointer.
-        let tdp_ret = unsafe { get_default_limit(dev, &mut limit_mw) };
-        let tdp_mw = if tdp_ret == NVML_SUCCESS {
-            tracing::debug!(
-                subsystem = %crate::log::Subsystem::GpuNvml,
-                device = i,
-                limit_mw,
-                "default power limit read",
-            );
-            limit_mw
-        } else {
-            tracing::debug!(
-                subsystem = %crate::log::Subsystem::GpuNvml,
-                device = i,
-                code = %crate::log::Hex(tdp_ret),
-                "GetPowerManagementDefaultLimit failed",
-            );
-            0
-        };
+        /// Resolve an optional NVML symbol; a missing one yields `None`
+        /// and costs only the metrics that depend on it.
+        macro_rules! load_fn_opt {
+            ($name:literal, $ty:ty) => {{
+                // SAFETY: handle is a valid loaded nvml.dll module.
+                let proc = unsafe { GetProcAddress(handle, PCSTR(concat!($name, "\0").as_ptr())) };
+                // SAFETY: when non-null, GetProcAddress returned the address of
+                // the named NVML symbol and the target type matches its
+                // documented signature.
+                proc.map(|p| unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(p)
+                })
+            }};
+        }
 
-        let mut uuid_buf = [0u8; NVML_DEVICE_UUID_BUFFER_SIZE];
-        // SAFETY: dev is a valid handle; uuid_buf is a valid mutable
-        // buffer with exactly NVML_DEVICE_UUID_BUFFER_SIZE bytes.
-        let uuid_ret = unsafe {
-            get_uuid(
-                dev,
-                uuid_buf.as_mut_ptr() as *mut c_char,
-                NVML_DEVICE_UUID_BUFFER_SIZE as u32,
-            )
-        };
-        let uuid = if uuid_ret == NVML_SUCCESS {
-            crate::collect::win::string_from_c_buf(&uuid_buf)
-        } else {
+        Some(Self {
+            init: load_fn!("nvmlInit_v2", NvmlInitV2),
+            shutdown: load_fn!("nvmlShutdown", NvmlShutdownFn),
+            get_count: load_fn!("nvmlDeviceGetCount_v2", NvmlDeviceGetCountV2),
+            get_handle: load_fn!(
+                "nvmlDeviceGetHandleByIndex_v2",
+                NvmlDeviceGetHandleByIndexV2
+            ),
+            get_default_limit: load_fn!(
+                "nvmlDeviceGetPowerManagementDefaultLimit",
+                NvmlDeviceGetPowerManagementDefaultLimit
+            ),
+            get_uuid: load_fn!("nvmlDeviceGetUUID", NvmlDeviceGetUuid),
+            get_utilization_rates: load_fn!(
+                "nvmlDeviceGetUtilizationRates",
+                NvmlDeviceGetUtilizationRates
+            ),
+            get_temperature: load_fn!("nvmlDeviceGetTemperature", NvmlDeviceGetTemperature),
+            get_power_usage: load_fn!("nvmlDeviceGetPowerUsage", NvmlDeviceGetPowerUsage),
+            get_clock_info: load_fn!("nvmlDeviceGetClockInfo", NvmlDeviceGetClockInfo),
+            get_max_clock_info: load_fn_opt!(
+                "nvmlDeviceGetMaxClockInfo",
+                NvmlDeviceGetMaxClockInfo
+            ),
+            _library: library,
+        })
+    }
+}
+
+/// Live NVML session: an initialised [`NvmlFunctions`] table whose
+/// device handles stay usable for the collector's lifetime.
+///
+/// Owned once per vendor by [`super::GpuCollector`] (via
+/// [`NvApiBundle`]) and dropped after the per-device entries, which
+/// hold the handles — the `Drop` impl calls `nvmlShutdown` exactly
+/// once per successful `nvmlInit_v2`.
+pub(super) struct NvmlSession {
+    nvml: NvmlFunctions,
+}
+
+impl NvmlSession {
+    /// Load `nvml.dll` and call `nvmlInit_v2`. Returns `None` when the
+    /// library is absent, a required symbol is missing, or
+    /// initialisation fails — in every case the caller falls back
+    /// to the NvAPI path for all metrics.
+    fn load() -> Option<Self> {
+        let nvml = NvmlFunctions::load()?;
+
+        // SAFETY: nvml.init was resolved from nvml.dll and matches the
+        // documented nvmlInit_v2 signature.
+        let ret = unsafe { (nvml.init)() };
+        if ret != NVML_SUCCESS {
             tracing::debug!(
                 subsystem = %crate::log::Subsystem::GpuNvml,
-                device = i,
-                code = %crate::log::Hex(uuid_ret),
-                "nvmlDeviceGetUUID failed",
+                code = %crate::log::Hex(ret),
+                "nvmlInit_v2 failed",
             );
-            String::new()
-        };
-
-        metas.push(NvmlMeta { tdp_mw, uuid });
+            return None;
+        }
+        Some(Self { nvml })
     }
 
-    // SAFETY: shutdown matches nvmlShutdown. Library handle stays valid
-    // via OwnedLibrary until this function returns.
-    unsafe { shutdown() };
+    /// Enumerate NVML devices with their static metadata, padded to
+    /// exactly `want` entries with `None` so the result can be zipped
+    /// 1:1 with the NvAPI device list.
+    ///
+    /// Index correspondence between NVML and NvAPI is documented as
+    /// "best-effort": both APIs typically enumerate in the same
+    /// driver-defined order (PCI bus). The TDP wiring has relied on
+    /// this ordering since rtop's first NVIDIA support; the UUID
+    /// wiring inherits the same assumption.
+    fn devices(&self, want: usize) -> Vec<Option<NvmlDeviceEntry>> {
+        let nvml = &self.nvml;
+        let mut count: u32 = 0;
+        // SAFETY: count is a valid pointer to a stack-allocated u32.
+        let _ = unsafe { (nvml.get_count)(&mut count) };
 
-    Some(metas)
+        let limit = (count as usize).min(want);
+        let mut entries: Vec<Option<NvmlDeviceEntry>> = Vec::with_capacity(want);
+        for i in 0..limit as u32 {
+            let mut handle: NvmlDevice = std::ptr::null_mut();
+            // SAFETY: i is within the reported count; handle is a valid
+            // pointer for the call to write through.
+            if unsafe { (nvml.get_handle)(i, &mut handle) } != NVML_SUCCESS || handle.is_null() {
+                entries.push(None);
+                continue;
+            }
+
+            let mut limit_mw: u32 = 0;
+            // SAFETY: handle is a valid device handle; limit_mw is a valid pointer.
+            let tdp_ret = unsafe { (nvml.get_default_limit)(handle, &mut limit_mw) };
+            let tdp_mw = if tdp_ret == NVML_SUCCESS {
+                tracing::debug!(
+                    subsystem = %crate::log::Subsystem::GpuNvml,
+                    device = i,
+                    limit_mw,
+                    "default power limit read",
+                );
+                limit_mw
+            } else {
+                tracing::debug!(
+                    subsystem = %crate::log::Subsystem::GpuNvml,
+                    device = i,
+                    code = %crate::log::Hex(tdp_ret),
+                    "GetPowerManagementDefaultLimit failed",
+                );
+                0
+            };
+
+            let mut uuid_buf = [0u8; NVML_DEVICE_UUID_BUFFER_SIZE];
+            // SAFETY: handle is a valid device handle; uuid_buf is a valid
+            // mutable buffer with exactly NVML_DEVICE_UUID_BUFFER_SIZE bytes.
+            let uuid_ret = unsafe {
+                (nvml.get_uuid)(
+                    handle,
+                    uuid_buf.as_mut_ptr() as *mut c_char,
+                    NVML_DEVICE_UUID_BUFFER_SIZE as u32,
+                )
+            };
+            let uuid = if uuid_ret == NVML_SUCCESS {
+                crate::collect::win::string_from_c_buf(&uuid_buf)
+            } else {
+                tracing::debug!(
+                    subsystem = %crate::log::Subsystem::GpuNvml,
+                    device = i,
+                    code = %crate::log::Hex(uuid_ret),
+                    "nvmlDeviceGetUUID failed",
+                );
+                String::new()
+            };
+
+            entries.push(Some(NvmlDeviceEntry {
+                handle,
+                tdp_mw,
+                uuid,
+            }));
+        }
+        entries.resize(want, None);
+        entries
+    }
+}
+
+impl Drop for NvmlSession {
+    fn drop(&mut self) {
+        // SAFETY: self.nvml.shutdown was resolved from nvml.dll and is
+        // called exactly once per successful `nvmlInit_v2` — the
+        // session is constructed only when init returns NVML_SUCCESS.
+        unsafe {
+            let _ = (self.nvml.shutdown)();
+        }
+    }
 }
 
 /// Convert a Per Cent Mille value to milliwatts using a TDP reference.
@@ -492,6 +616,10 @@ impl Drop for NvApiSession {
 /// [`super::GpuCollector`].
 pub(super) struct DeviceState {
     pub(super) handle: SendNvHandle,
+    /// Matching NVML device handle, or `None` when NVML is unavailable
+    /// or reported fewer devices than NvAPI. The handle stays valid
+    /// for the collector's lifetime (it dies with [`NvmlSession`]).
+    pub(super) nvml: Option<NvmlDevice>,
     /// Default power limit (TDP) in milliwatts, from NVML during
     /// discovery. Used to convert NvAPI Per-Cent-Mille power
     /// readings into milliwatts.
@@ -500,68 +628,121 @@ pub(super) struct DeviceState {
 
 /// One collection cycle for a single NVIDIA device.
 ///
+/// Metrics are read from NVML first and from NvAPI second. The split
+/// is not a preference: current NVIDIA drivers (570+) answer
+/// `NVAPI_NOT_SUPPORTED` for the legacy NvAPI queries rtop
+/// originally used for utilization, temperature, power, and clocks,
+/// so on a modern driver the NvAPI leg is effectively dead code that
+/// still serves older ones. A metric is only reported as degraded
+/// when neither leg produced a reading.
+///
 /// Reads vendor function pointers from `session`, the per-device
-/// handle and TDP from `dev`, mutates the rendered `info` in place,
+/// handles and TDP from `dev`, mutates the rendered `info` in place,
 /// and downgrades `status` on partial failures.
 pub(super) fn collect(
     session: &NvApiSession,
+    nvml: Option<&NvmlSession>,
     dev: &DeviceState,
     info: &mut crate::domain::gpu::GpuInfo,
     status: &mut CollectStatus,
 ) {
     let nvapi = &session.nvapi;
     let device = dev.handle.0;
+    // Pair the session with this device's NVML handle once; `None`
+    // when NVML is unavailable or has no handle for this adapter.
+    let nvml = nvml.zip(dev.nvml);
 
-    let mut pstates = NvDynamicPstatesInfoEx {
-        version: PSTATES_INFO_VER,
-        flags: 0,
-        utilizations: [NvUtilDomain::default(); 8],
-    };
-    // SAFETY: device is a valid handle obtained during discovery.
-    let ret = unsafe { (nvapi.get_dynamic_pstates_info_ex)(device, &mut pstates) };
-    if ret == NVAPI_OK {
-        let gpu_util = &pstates.utilizations[0];
-        if gpu_util.flags & 1 != 0 {
-            push_history(
-                &mut info.gpu_percent.utilization,
-                clamp_percent(gpu_util.percentage),
+    // ---- Utilization --------------------------------------------------
+    let mut recorded = false;
+    if let Some((nvml, handle)) = nvml {
+        let mut util = NvmlUtilization::default();
+        // SAFETY: handle is a live NVML device handle owned by the session.
+        let ret = unsafe { (nvml.nvml.get_utilization_rates)(handle, &mut util) };
+        if ret == NVML_SUCCESS {
+            push_history(&mut info.gpu_percent.utilization, clamp_percent(util.gpu));
+            recorded = true;
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvml,
+                code = %crate::log::Hex(ret),
+                "nvmlDeviceGetUtilizationRates failed",
             );
         }
-    } else {
-        tracing::debug!(
-            subsystem = %crate::log::Subsystem::GpuNvapi,
-            code = %crate::log::Hex(ret),
-            "NvAPI utilization query failed",
-        );
-        status.downgrade(CollectStatus::Degraded("nvapi utilization"));
+    }
+    if !recorded {
+        let mut pstates = NvDynamicPstatesInfoEx {
+            version: PSTATES_INFO_VER,
+            flags: 0,
+            utilizations: [NvUtilDomain::default(); 8],
+        };
+        // SAFETY: device is a valid handle obtained during discovery.
+        let ret = unsafe { (nvapi.get_dynamic_pstates_info_ex)(device, &mut pstates) };
+        if ret == NVAPI_OK {
+            let gpu_util = &pstates.utilizations[0];
+            if gpu_util.flags & 1 != 0 {
+                push_history(
+                    &mut info.gpu_percent.utilization,
+                    clamp_percent(gpu_util.percentage),
+                );
+            }
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvapi,
+                code = %crate::log::Hex(ret),
+                "NvAPI utilization query failed",
+            );
+            status.downgrade(CollectStatus::Degraded("gpu utilization"));
+        }
     }
 
-    // Temperature — request all sensors, pick the GPU target.
-    let mut thermal = NvThermalSettings {
-        version: THERMAL_SETTINGS_VER,
-        count: 0,
-        sensors: [NvThermalSensor::default(); 3],
-    };
-    // SAFETY: device is valid; NVAPI_THERMAL_TARGET_ALL requests all sensors.
-    let ret =
-        unsafe { (nvapi.get_thermal_settings)(device, NVAPI_THERMAL_TARGET_ALL, &mut thermal) };
-    if ret == NVAPI_OK {
-        let temp = thermal.sensors[..thermal.count as usize]
-            .iter()
-            .find(|s| s.target == NVAPI_THERMAL_TARGET_GPU)
-            .or_else(|| thermal.sensors.first())
-            .map(|s| s.current_temp as i64)
-            .unwrap_or(0);
-        push_history(&mut info.temp, temp);
-    } else {
-        tracing::debug!(
-            subsystem = %crate::log::Subsystem::GpuNvapi,
-            code = %crate::log::Hex(ret),
-            "NvAPI temperature query failed",
-        );
-        status.downgrade(CollectStatus::Degraded("nvapi temperature"));
+    // ---- Temperature --------------------------------------------------
+    let mut recorded = false;
+    if let Some((nvml, handle)) = nvml {
+        let mut temp: u32 = 0;
+        // SAFETY: handle is a live NVML device handle owned by the session.
+        let ret = unsafe { (nvml.nvml.get_temperature)(handle, NVML_TEMPERATURE_GPU, &mut temp) };
+        if ret == NVML_SUCCESS {
+            push_history(&mut info.temp, i64::from(temp));
+            recorded = true;
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvml,
+                code = %crate::log::Hex(ret),
+                "nvmlDeviceGetTemperature failed",
+            );
+        }
+    }
+    if !recorded {
+        // NvAPI fallback — request all sensors, pick the GPU target.
+        let mut thermal = NvThermalSettings {
+            version: THERMAL_SETTINGS_VER,
+            count: 0,
+            sensors: [NvThermalSensor::default(); 3],
+        };
+        // SAFETY: device is valid; NVAPI_THERMAL_TARGET_ALL requests all sensors.
+        let ret =
+            unsafe { (nvapi.get_thermal_settings)(device, NVAPI_THERMAL_TARGET_ALL, &mut thermal) };
+        if ret == NVAPI_OK {
+            let temp = thermal.sensors[..thermal.count as usize]
+                .iter()
+                .find(|s| s.target == NVAPI_THERMAL_TARGET_GPU)
+                .or_else(|| thermal.sensors.first())
+                .map(|s| s.current_temp as i64)
+                .unwrap_or(0);
+            push_history(&mut info.temp, temp);
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvapi,
+                code = %crate::log::Hex(ret),
+                "NvAPI temperature query failed",
+            );
+            status.downgrade(CollectStatus::Degraded("gpu temperature"));
+        }
     }
 
+    // ---- Memory (VRAM) ------------------------------------------------
+    // NvAPI's memory query is still served by current drivers, so it
+    // stays the single source for VRAM.
     let mut mem = NvMemoryInfo {
         version: MEMORY_INFO_VER,
         dedicated_video_memory_kb: 0,
@@ -592,8 +773,29 @@ pub(super) fn collect(
         status.downgrade(CollectStatus::Degraded("nvapi memory"));
     }
 
-    // Power — pick the Board domain entry (PCM) and convert to mW.
-    if dev.tdp_mw > 0 {
+    // ---- Power --------------------------------------------------------
+    let mut recorded = false;
+    if let Some((nvml, handle)) = nvml {
+        let mut milliwatts: u32 = 0;
+        // SAFETY: handle is a live NVML device handle owned by the session.
+        let ret = unsafe { (nvml.nvml.get_power_usage)(handle, &mut milliwatts) };
+        if ret == NVML_SUCCESS {
+            let power_mw = u64::from(milliwatts);
+            info.pwr_usage = power_mw as i64;
+            let pwr_pct = power_percent(power_mw, info.pwr_max_usage as u64);
+            push_history(&mut info.gpu_percent.power, pwr_pct);
+            recorded = true;
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvml,
+                code = %crate::log::Hex(ret),
+                "nvmlDeviceGetPowerUsage failed",
+            );
+        }
+    }
+    if !recorded && dev.tdp_mw > 0 {
+        // NvAPI fallback — pick the Board domain entry (PCM) and
+        // convert it to mW.
         let mut topo = NvPowerTopo {
             version: POWER_TOPO_VER,
             count: 0,
@@ -619,29 +821,49 @@ pub(super) fn collect(
                 code = %crate::log::Hex(ret),
                 "NvAPI power topology query failed",
             );
-            status.downgrade(CollectStatus::Degraded("nvapi power"));
+            status.downgrade(CollectStatus::Degraded("gpu power"));
         }
     }
 
-    let mut clocks = NvClockFrequencies {
-        version: CLOCK_FREQUENCIES_VER,
-        clock_type: CLOCK_TYPE_CURRENT,
-        domains: [NvClockDomain::default(); 32],
-    };
-    // SAFETY: device is valid; clocks is a valid versioned struct.
-    let ret = unsafe { (nvapi.get_all_clock_frequencies)(device, &mut clocks) };
-    if ret == NVAPI_OK {
-        let gfx = &clocks.domains[CLOCK_DOMAIN_GRAPHICS];
-        if gfx.flags & 1 != 0 {
-            info.gpu_clock_speed = gfx.frequency_khz / 1000;
+    // ---- Graphics clock -----------------------------------------------
+    let mut recorded = false;
+    if let Some((nvml, handle)) = nvml {
+        let mut megahertz: u32 = 0;
+        // SAFETY: handle is a live NVML device handle owned by the session.
+        let ret =
+            unsafe { (nvml.nvml.get_clock_info)(handle, NVML_CLOCK_GRAPHICS, &mut megahertz) };
+        if ret == NVML_SUCCESS {
+            info.gpu_clock_speed = megahertz;
+            recorded = true;
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvml,
+                code = %crate::log::Hex(ret),
+                "nvmlDeviceGetClockInfo failed",
+            );
         }
-    } else {
-        tracing::debug!(
-            subsystem = %crate::log::Subsystem::GpuNvapi,
-            code = %crate::log::Hex(ret),
-            "NvAPI clock query failed",
-        );
-        status.downgrade(CollectStatus::Degraded("nvapi clock"));
+    }
+    if !recorded {
+        let mut clocks = NvClockFrequencies {
+            version: CLOCK_FREQUENCIES_VER,
+            clock_type: CLOCK_TYPE_CURRENT,
+            domains: [NvClockDomain::default(); 32],
+        };
+        // SAFETY: device is valid; clocks is a valid versioned struct.
+        let ret = unsafe { (nvapi.get_all_clock_frequencies)(device, &mut clocks) };
+        if ret == NVAPI_OK {
+            let gfx = &clocks.domains[CLOCK_DOMAIN_GRAPHICS];
+            if gfx.flags & 1 != 0 {
+                info.gpu_clock_speed = gfx.frequency_khz / 1000;
+            }
+        } else {
+            tracing::debug!(
+                subsystem = %crate::log::Subsystem::GpuNvapi,
+                code = %crate::log::Hex(ret),
+                "NvAPI clock query failed",
+            );
+            status.downgrade(CollectStatus::Degraded("gpu clock"));
+        }
     }
 }
 
@@ -652,6 +874,10 @@ pub(super) fn collect(
 /// lifetime of every device entry derived from this bundle.
 pub(super) struct NvApiBundle {
     pub(super) session: NvApiSession,
+    /// Live NVML session, or `None` when NVML could not be opened.
+    /// Declared after `session` so it outlives the per-device NVML
+    /// handles held in `entries`.
+    pub(super) nvml: Option<NvmlSession>,
     pub(super) entries: Vec<(DeviceState, crate::domain::gpu::GpuInfo)>,
 }
 
@@ -680,34 +906,35 @@ pub(super) fn discover() -> Option<NvApiBundle> {
     }
     let devices: Vec<NvPhysicalGpuHandle> = handles[..count].to_vec();
 
-    // Query per-device metadata (default TDP for PCM→mW
-    // conversion, plus stable UUID for cross-run identity) from
-    // NVML. Pad with empty meta entries so the zip always has
-    // `count` slots — devices beyond NVML's reported count fall
-    // back to TDP 0 + empty UUID.
-    let nvml_metas: Vec<NvmlMeta> = query_nvml_metadata(count)
-        .unwrap_or_default()
-        .into_iter()
-        .chain(std::iter::repeat_with(|| NvmlMeta {
-            tdp_mw: 0,
-            uuid: String::new(),
-        }))
-        .take(count)
-        .collect();
+    // Open an NVML session: it carries the per-device handles used by
+    // every collect cycle plus the static metadata (default TDP for
+    // the PCM→mW conversion and the stable UUID for cross-run
+    // identity). The device list is padded to `count` entries with
+    // `None` so the zip always lines up; slots NVML did not report
+    // fall back to TDP 0 + empty UUID and NvAPI-only metrics.
+    let nvml = NvmlSession::load();
+    let nvml_devices: Vec<Option<NvmlDeviceEntry>> = nvml
+        .as_ref()
+        .map(|session| session.devices(count))
+        .unwrap_or_default();
 
     tracing::info!(
         subsystem = %crate::log::Subsystem::GpuNvapi,
         devices = count,
+        nvml = nvml.is_some(),
         "vendor initialized",
     );
 
     let entries: Vec<(DeviceState, crate::domain::gpu::GpuInfo)> = devices
         .into_iter()
-        .zip(nvml_metas)
+        .zip(nvml_devices)
         .enumerate()
         .map(|(idx, (device, meta))| {
-            let tdp_mw = u64::from(meta.tdp_mw);
-            let stable_id = if meta.uuid.is_empty() {
+            let (nvml_handle, tdp_mw, uuid) = match meta {
+                Some(meta) => (Some(meta.handle), u64::from(meta.tdp_mw), meta.uuid),
+                None => (None, 0, String::new()),
+            };
+            let stable_id = if uuid.is_empty() {
                 tracing::debug!(
                     subsystem = %crate::log::Subsystem::GpuNvapi,
                     device = idx,
@@ -715,12 +942,19 @@ pub(super) fn discover() -> Option<NvApiBundle> {
                 );
                 format!("NVIDIA:adapter:{idx}")
             } else {
-                format!("NVIDIA:{}", meta.uuid)
+                format!("NVIDIA:{uuid}")
             };
-            let info = build_initial_info(&session.nvapi, device, tdp_mw, stable_id);
+            let info = build_initial_info(
+                &session.nvapi,
+                nvml.as_ref().zip(nvml_handle),
+                device,
+                tdp_mw,
+                stable_id,
+            );
             (
                 DeviceState {
                     handle: SendNvHandle(device),
+                    nvml: nvml_handle,
                     tdp_mw,
                 },
                 info,
@@ -728,7 +962,11 @@ pub(super) fn discover() -> Option<NvApiBundle> {
         })
         .collect();
 
-    Some(NvApiBundle { session, entries })
+    Some(NvApiBundle {
+        session,
+        nvml,
+        entries,
+    })
 }
 
 /// Pre-fill the per-device `GpuInfo` with static fields (stable
@@ -737,6 +975,7 @@ pub(super) fn discover() -> Option<NvApiBundle> {
 /// AMD's [`build_initial_info`](super::amd) helper for parity.
 fn build_initial_info(
     nvapi: &NvApiFunctions,
+    nvml: Option<(&NvmlSession, NvmlDevice)>,
     device: NvPhysicalGpuHandle,
     tdp_mw: u64,
     stable_id: String,
@@ -789,6 +1028,24 @@ fn build_initial_info(
         if gfx.flags & 1 != 0 {
             info.gpu_max_clock_speed = gfx.frequency_khz / 1000;
         }
+    } else if let Some((nvml, handle)) = nvml {
+        // NvAPI's boost-clock query is one of the entry points current
+        // drivers refuse; NVML still serves the max clock.
+        if let Some(get_max_clock_info) = nvml.nvml.get_max_clock_info {
+            let mut megahertz: u32 = 0;
+            // SAFETY: handle is a live NVML device handle owned by the session.
+            let nvml_ret =
+                unsafe { get_max_clock_info(handle, NVML_CLOCK_GRAPHICS, &mut megahertz) };
+            if nvml_ret == NVML_SUCCESS {
+                info.gpu_max_clock_speed = megahertz;
+            } else {
+                tracing::debug!(
+                    subsystem = %crate::log::Subsystem::GpuNvml,
+                    code = %crate::log::Hex(nvml_ret),
+                    "nvmlDeviceGetMaxClockInfo failed",
+                );
+            }
+        }
     }
 
     info
@@ -811,6 +1068,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<NvPowerTopo>(), 72);
         assert_eq!(std::mem::size_of::<NvPowerInfoEntry>(), 44);
         assert_eq!(std::mem::size_of::<NvPowerInfo>(), 184);
+        assert_eq!(std::mem::size_of::<NvmlUtilization>(), 8);
     }
 
     #[test]

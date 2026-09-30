@@ -19,6 +19,11 @@
 //! `nvidia/amd/intel::DeviceState` structs that carry only the
 //! genuinely per-device fields (handles, prev counters).
 //!
+//! NVIDIA is the exception: [`nvidia::NvmlSession`] is held alongside
+//! the NvAPI session because NVML — not NvAPI — is what current
+//! drivers answer for utilization, temperature, power, and clocks.
+//! Per-device state therefore carries one handle of each flavour.
+//!
 //! # Drop ordering
 //!
 //! [`GpuCollector`] declares `devices` first so it drops first. The
@@ -102,6 +107,13 @@ pub(crate) struct GpuCollector {
     /// dropped the session immediately rather than retaining an
     /// idle library handle).
     nvapi: Option<nvidia::NvApiSession>,
+
+    /// NVIDIA's NVML session, which supplies the metrics current
+    /// drivers no longer serve through NvAPI. `None` when NVML could
+    /// not be opened; the collector then falls back to NvAPI alone.
+    /// Declared after `nvapi` so it outlives the per-device NVML
+    /// handles in `devices`.
+    nvml: Option<nvidia::NvmlSession>,
     adl: Option<amd::AdlSession>,
     igcl: Option<intel::IgclSession>,
 
@@ -130,12 +142,14 @@ impl GpuCollector {
     pub(crate) fn new() -> Self {
         let mut devices: Vec<DeviceEntry> = Vec::new();
 
+        let mut nvml = None;
         let nvapi = nvidia::discover().map(|bundle| {
             devices.extend(bundle.entries.into_iter().map(|(d, info)| DeviceEntry {
                 device: GpuDevice::Nvidia(d),
                 info,
                 status: CollectStatus::Ok,
             }));
+            nvml = bundle.nvml;
             bundle.session
         });
         let adl = amd::discover().map(|bundle| {
@@ -164,6 +178,7 @@ impl GpuCollector {
         Self {
             devices,
             nvapi,
+            nvml,
             adl,
             igcl,
             status: CollectStatus::Ok,
@@ -184,6 +199,7 @@ impl Collector for GpuCollector {
                         "GpuDevice::Nvidia entry implies nvapi.is_some() — both are populated \
                          together by GpuCollector::new",
                     ),
+                    self.nvml.as_ref(),
                     d,
                     &mut entry.info,
                     &mut entry.status,
